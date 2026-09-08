@@ -1,0 +1,5 @@
+[autorun]
+open=run.bat
+icon=run.bat
+label=Inference Key
+action=Start LLM Inference Server

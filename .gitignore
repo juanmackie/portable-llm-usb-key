@@ -1,0 +1,27 @@
+# Binaries and models are downloaded/copied onto the stick, never committed.
+# Binaries: scripts/../get-binaries.ps1    Models: models\README.txt
+/bin/
+/models/*
+!/models/README.txt
+*.gguf
+
+# Runtime state. Generated on the stick, and contains the live API key, the current
+# public URL and this machine's name - none of which belongs in a public repo.
+/logs/
+/tmp/
+/config/api.key
+/config/state.json
+/config/profile.txt
+/config/public_url.txt
+
+# Old versions of the entry points. Contains a file named "nul", which git cannot
+# check out on Windows (reserved device name) - so it stays out on purpose.
+/legacy/
+
+# Drive noise
+/System Volume Information/
+/$RECYCLE.BIN/
+/Boot/
+/ntldr
+/desktop.ini
+Thumbs.db

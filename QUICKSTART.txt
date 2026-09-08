@@ -1,0 +1,66 @@
+=====================================================================
+ LLM INFERENCE USB KEY - QUICK START   (first time here? read this)
+=====================================================================
+
+WHAT THIS IS
+  A local OpenAI-compatible chat server (llama.cpp) that runs straight
+  off this stick on any Windows 10/11 laptop. No installer, no admin
+  rights, nothing is installed on the computer: all logs, temp files,
+  settings and models stay here on the stick. It can also answer from
+  the internet over HTTPS.
+
+START IT  (one double-click)
+  launch.vbs    Start silently. Nothing opens - that is normal.
+  run.bat       Same, but in a visible window. USE THIS THE FIRST TIME
+                on any new laptop, it shows what it decided and why.
+  status.bat    Is it up? Local URL, public URL, API key, and it proves
+                the public URL really answers.
+  stop.bat      Stop everything and close the public URL.
+
+IT IS NOT INSTANT
+  The model is many gigabytes and has to be read off USB: roughly 1-3
+  minutes on USB 3, much longer on USB 2. status.bat says "loading"
+  until it can answer. Check again in a minute, it is not stuck.
+
+USE IT  (once status.bat shows a public URL)
+  Any OpenAI client works.
+    base URL = the "public" line from status.bat, plus /v1
+    API key  = the "api key" line from status.bat
+    model    = local
+
+  curl (cmd):
+    curl -X POST "https://XXXX.trycloudflare.com/v1/chat/completions" ^
+         -H "Authorization: Bearer PASTE_KEY_FROM_status.bat" ^
+         -H "Content-Type: application/json" ^
+         -d "{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}"
+
+  Python:
+    from openai import OpenAI
+    c = OpenAI(base_url="https://XXXX.trycloudflare.com/v1",
+               api_key="key from status.bat")
+    r = c.chat.completions.create(model="local",
+              messages=[{"role": "user", "content": "hello"}])
+    print(r.choices[0].message.content)
+
+  The public address CHANGES every time the tunnel restarts. Run
+  status.bat after each start to get the current one. Without the key,
+  the public URL answers 401 - that is the point.
+
+WHICH MODEL, WHICH GPU
+  The stick uses the biggest model in models\ that this laptop can hold.
+  If a model is too big for the machine it is skipped and a smaller one
+  is used instead; the reason is in logs\supervisor.log.
+  GPU: it tries CUDA, then Vulkan, then CPU, and switches on its own if
+  one cannot run here. You never have to touch that.
+
+IF IT DOES NOT DO WHAT YOU WANT
+  1. run.bat              the window says what it refused, and why
+  2. status.bat           what is up, what is not
+  3. logs\supervisor.log  the whole story, newest at the bottom
+  Nothing is broken permanently - fix the cause, double-click launch.vbs.
+
+BEFORE YOU PULL THE STICK OUT
+  Double-click stop.bat. It also shuts itself down if a model keeps
+  failing to load, so it cannot quietly run your battery flat overnight.
+
+  More detail (settings, tuning, what each log means): README.md
