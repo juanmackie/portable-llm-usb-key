@@ -52,7 +52,9 @@ model this laptop can actually hold** and says so in `logs\supervisor.log`:
 - `models/selftest-260K.gguf` (1 MB) is a toy model that proves the chain works on a machine
   too small for the real one. Delete it when you no longer want that fallback.
 - Fit guide: 6 GB VRAM + 16 GB RAM → 7–9 B Q4. A 27 B Q4 (~16 GB) wants 32 GB RAM or a 24 GB
-  card. `ngl=auto` leaves the GPU/CPU split to llama.cpp's own `--fit`.
+  card (a 16 GB card runs it on the edge). Default `ngl=99` offloads every layer the GPU can
+  hold (~10× faster than splitting); a host whose GPU cannot fit the model falls back to
+  `ngl=auto` (llama.cpp `--fit`) once and remembers it in `config\profile.txt`.
 - `models/mtp-INCOMPLETE-Qwen3.8-27B-Q4_0.gguf` is 1.4 GB where a 27 B Q4_0 is ~16 GB — a truncated
   download that cannot be loaded. It is also not needed: this model carries **native MTP layers**
   (`qwen35.nextn_predict_layers`), so speculative decode is `spec_type=draft-mtp` with no second

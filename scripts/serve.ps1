@@ -338,7 +338,8 @@ if ($prof) {
     if ($f.Count -ge 3 -and $f[0] -eq $env:COMPUTERNAME) {
         $i = $becands.IndexOf($f[1]); if ($i -ge 0) { $beIdx = $i }
         if ($f[2] -match '^[012]$') { $level = [int]$f[2] }
-        Log "[cfg] last run here worked: backend=$($becands[$beIdx]) level=$level - delete config\profile.txt to retry everything"
+        if ($f.Count -ge 4 -and $f[3] -match '^(?i:auto|\d+)$') { $cfg.ngl = $f[3] }
+        Log "[cfg] last run here worked: backend=$($becands[$beIdx]) level=$level ngl=$($cfg.ngl) - delete config\profile.txt to retry everything"
     }
 }
 # Snapshot the log size before launching: llama.cpp rewrites --log-file, so an exactly unchanged
@@ -380,7 +381,7 @@ while ($true) {
     Start-Sleep -Seconds 10
 
     if (Test-Health $cfg) { $fastFails = 0
-        if (-not $everHealthy) { $everHealthy = $true; Set-Content -Path $ProfPath -Value ($env:COMPUTERNAME + '|' + $becands[$beIdx] + '|' + $level) -Encoding ASCII }  # remember what worked
+        if (-not $everHealthy) { $everHealthy = $true; Set-Content -Path $ProfPath -Value ($env:COMPUTERNAME + '|' + $becands[$beIdx] + '|' + $level + '|' + $cfg.ngl) -Encoding ASCII }  # remember what worked
     }
 
     # Alive but never healthy and server.log has not grown for ~6 min => wedged (a hung load, a
@@ -405,7 +406,14 @@ while ($true) {
         # config argument, which no backend change can fix.
         $noOutput = ((Get-LogLen) -eq $attemptLogLen)
         $beFatal = ($noOutput -or (Test-BackendFatal))
-        if ($young -and $beFatal -and $beIdx -lt ($becands.Count - 1)) {
+        # A forced numeric ngl died before ever serving: almost always "model won't fit this GPU's
+        # VRAM", not a dead backend. Retry the SAME backend at ngl=auto - the branches below would
+        # abandon a perfectly good GPU (changing backend, or giving up after three fast fails).
+        # Bounded: ngl becomes 'auto', so this branch fires at most once per load.
+        if ($young -and $cfg.ngl -match '^\d+$') {
+            Log ("[wd] ngl={0} cannot fit this GPU -> retrying ngl=auto (host remembers in profile.txt)" -f $cfg.ngl)
+            $cfg.ngl = 'auto'; $level = 0
+        } elseif ($young -and $beFatal -and $beIdx -lt ($becands.Count - 1)) {
             Log ('[wd] {0} cannot run here ({1}) -> backend {2}' -f $becands[$beIdx], $(if ($noOutput) { 'binary produced no output' } else { 'backend/driver error in server.log' }), $becands[$beIdx + 1])
             $beIdx++; $level = 0
         } elseif ($young -and $level -lt 2) {
