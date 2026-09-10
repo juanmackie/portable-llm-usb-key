@@ -41,7 +41,6 @@ for _ in range(nkv):
     k = rstr(f); (t,) = struct.unpack('<I', rd(f,4)); md[k] = rval(f, t)
 arch = md.get('general.architecture', '?')
 align = md.get('general.alignment', 32)
-tinfo_end = None
 maxoff = 0; dims_seen = set(); qtypes = {}
 for _ in range(nt):
     nm = rstr(f); (nd,) = struct.unpack('<I', rd(f,4))
@@ -59,8 +58,6 @@ ok = fsize > data_start + maxoff
 print('truncation      : %s' % ('OK - file is large enough to hold every tensor' if ok else 'TRUNCATED - file ends before the last tensor'))
 ct = md.get('tokenizer.chat_template') or ''
 print('chat template   : %s (%d chars)' % ('present' if ct else 'MISSING - chat requests will fall back to plain prompt', len(ct)))
-for k in ('tokenizer.ggml.eos_token_id','tokenizer.ggml.bos_token_id','tokenizer.ggml.padding_token_id','tokenizer.ggmlモデル' ):
-    pass
 print('eos/bos/pad ids : %s / %s / %s' % (md.get('tokenizer.ggml.eos_token_id'), md.get('tokenizer.ggml.bos_token_id'), md.get('tokenizer.ggml.padding_token_id')))
 print('vocab / type    : %s tokens, %s' % (md.get('tokenizer.ggml.tokens') and len(md['tokenizer.ggml.tokens']), md.get('tokenizer.ggml.model')))
 print('kv cache hints  : head_dim=%s  n_head=%s  n_head_kv=%s' % (md.get(arch+'.attention.length_k'), md.get(arch+'.attention.head_count'), md.get(arch+'.attention.head_count_kv')))

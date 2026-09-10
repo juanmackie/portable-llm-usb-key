@@ -1,0 +1,32 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  windows-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every PowerShell script
+        shell: pwsh
+        run: |
+          $fail = 0
+          foreach ($f in (Get-ChildItem -Recurse -Include *.ps1)) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs) { $fail = 1; $errs | ForEach-Object { Write-Host ("PARSE {0}:{1} {2}" -f $_.File, $_.Extent.StartLineNumber, $_.Message) } }
+            else { Write-Host ("parse OK  {0}" -f $f.Name) }
+          }
+          exit $fail
+      - name: Compile the Python checker
+        shell: pwsh
+        run: python -m py_compile scripts/gguf-check.py; exit $LASTEXITCODE
+      - name: CRLF check (cmd and wscript cannot tolerate LF)
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($pat in "*.bat", "*.vbs", "*.ini") {
+            foreach ($f in (Get-ChildItem -Recurse -Include $pat)) {
+              $t = [IO.File]::ReadAllText($f.FullName)
+              if ($t -notmatch "\r\n") { $bad = 1; Write-Host ("NO CRLF: {0}" -f $f.FullName) }
+            }
+          }
+          exit $bad

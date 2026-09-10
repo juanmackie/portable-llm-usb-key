@@ -10,8 +10,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('start','stop','status')][string]$Action = 'start',
-    [switch]$Visible
+    [ValidateSet('start','stop','status')][string]$Action = 'start'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -38,11 +37,13 @@ $KeyPath   = Join-Path $CfgDir 'api.key'
 $SrvLog    = Join-Path $LogDir 'server.log'
 $TunLog    = Join-Path $LogDir 'tunnel.log'
 $SupLog    = Join-Path $LogDir 'supervisor.log'
+$SessLog   = Join-Path $LogDir 'session.log'    # per-session review file, overwritten at every start
 $ModelsDir = Join-Path $Root 'models'
 
 function Log([string]$m) {
     $line = '{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
     Add-Content -Path $SupLog -Value $line
+    Add-Content -Path $SessLog -Value $line      # tiny tee: events only, ticks never log
     Write-Host $line
 }
 
@@ -50,7 +51,8 @@ function Read-Ini {
     $cfg = [ordered]@{
         port='8080'; host='0.0.0.0'; ctx_size='8192'; ngl='auto'; batch='2048'; ubatch='512'
         threads='0'; kvct='q8_0'; flash_attn='auto'; spec_type='none'; spec_nmax='3'; spec_pmin='0.75'
-        model=''; backend=''; alias='local'; webui='off'; keepawake='on'
+        model=''; backend=''; alias='local'; webui='off'; keepawake='on'; device=''
+        tunnel_token=''; tunnel_url=''
         # tunnel defaults OFF on purpose: if settings.ini is missing or unreadable we must
         # never expose the port. config\settings.ini ships with tunnel=on.
         tunnel='off'
@@ -61,6 +63,29 @@ function Read-Ini {
             if ($l -match '^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$') { $cfg[$Matches[1].ToLower()] = $Matches[2] }
         }
     }
+    # Validate before anything consumes a value: a corrupt knob shipped to llama-server as an
+    # empty argument dies during load and the watchdog misreads that as a backend problem.
+    # status must stay read-only, so defaults are only logged during start.
+    $def = @{ port='8080'; ctx_size='8192'; batch='2048'; ubatch='512'; spec_nmax='3'; spec_pmin='0.75';
+              flash_attn='auto'; webui='off'; tunnel='off'; keepawake='on'; ngl='auto' }
+    foreach ($k in @($def.Keys)) {
+        $v = "$($cfg[$k])"
+        $ok = switch ($k) {
+            port       { $v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le 65535 }
+            spec_pmin  { $v -match '^\d?\.?\d+$' }
+            ngl        { $v -match '^(?i:auto|\d+)$' }
+            flash_attn { $v -match '^(?i:on|off|auto)$' }
+            tunnel     { $v -match '^(?i:on|off)$' }
+            webui      { $v -match '^(?i:on|off)$' }
+            keepawake  { $v -match '^(?i:on|off)$' }
+            default    { $v -match '^\d+$' }   # ctx_size batch ubatch spec_nmax
+        }
+        if (-not $ok) {
+            if ($Action -eq 'start') { Log ("[cfg] invalid {0}='{1}' - using default '{2}'" -f $k, $v, $def[$k]) }
+            $cfg[$k] = $def[$k]
+        }
+    }
+    $cfg.model = "$($cfg.model)".TrimEnd('\')   # a trailing backslash would break CommandLineToArgvW quoting
     return $cfg
 }
 
@@ -68,16 +93,31 @@ function Get-Backends([string]$override) {
     # Ordered list of backends to try. Order matters: a backend that cannot load the model at all
     # (CUDA build without SASS/PTX for a Blackwell card, cudart/cublas missing on the host) must
     # fall through to vulkan -> cpu instead of burning three retries on the same dead binary.
-    if ($override) { return @($override -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    $list = @()
-    if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { $list += 'cuda' }
-    if (Test-Path (Join-Path $env:SystemRoot 'System32\vulkan-1.dll')) {
-        $g = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
-              Select-Object -ExpandProperty Name) -join ' '
-        if ($g -match 'Intel|NVIDIA|AMD|Radeon|Arc') { $list += 'vulkan' }
+    if ($override) { $cand = @($override -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { $cand = @()
+        if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { $cand += 'cuda' }
+        if (Test-Path (Join-Path $env:SystemRoot 'System32\vulkan-1.dll')) {
+            $g = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+                  Select-Object -ExpandProperty Name) -join ' '
+            if ($g -match 'Intel|NVIDIA|AMD|Radeon|Arc') { $cand += 'vulkan' }
+        }
+        $cand += 'cpu'
     }
-    $list += 'cpu'
-    return @($list | Where-Object { Test-Path (Join-Path $Root "bin\$_\llama-server.exe") })
+    $cand = @($cand | Where-Object { Test-Path (Join-Path $Root "bin\$_\llama-server.exe") })
+    # A CUDA build without SASS for this GPU (sm_86/89/120) sees zero devices and then "succeeds"
+    # on CPU at a fifth of the speed, with no error anywhere. Ask the binary itself, once per run.
+    if ($cand -contains 'cuda') {
+        if ($null -eq $script:CudaVis) {
+            $d = ''
+            try { $d = (& (Join-Path $Root 'bin\cuda\llama-server.exe') --list-devices 2>$null | Out-String) } catch { }
+            $script:CudaVis = ($d.Trim().Length -gt 0 -and $d -notmatch '\(none\)')
+        }
+        if (-not $script:CudaVis) {
+            Log '[be] the cuda build sees no CUDA device here - skipping cuda (silent-CPU trap).'
+            $cand = @($cand | Where-Object { $_ -ne 'cuda' })
+        }
+    }
+    if (-not $cand.Count) { $cand = @('cpu') }   # sole requested backend ruled out: still try cpu
+    return @($cand | Select-Object -Unique)
 }
 
 function Get-Backend([string]$override) { return @(Get-Backends $override)[0] }
@@ -135,11 +175,26 @@ function Test-Fits([string]$main) {
     return $true
 }
 
+function Stop-OurBinaries {
+    # Ours only: llama-server / cloudflared processes whose image lives under $Root.
+    foreach ($n in 'llama-server','cloudflared') {
+        Get-CimInstance Win32_Process -Filter "Name='$n.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Root, 2) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Test-PortFree($cfg) {
     try {
         $c = New-Object Net.Sockets.TcpClient
         $c.Connect('127.0.0.1', [int]$cfg.port); $c.Close()
-        Log ("[pre] REFUSE: port {0} is already taken by another process - free it or change 'port' in config\settings.ini." -f $cfg.port)
+        # Taken - but it may be OURS from a crash that lost state.json. Sweep ours, re-test;
+        # only a foreign holder is a reason to refuse.
+        Stop-OurBinaries
+        Start-Sleep -Seconds 1
+        try { $c2 = New-Object Net.Sockets.TcpClient; $c2.Connect('127.0.0.1', [int]$cfg.port); $c2.Close() }
+        catch { return $true }
+        Log ("[pre] REFUSE: port {0} is held by a process that is not ours - free it or change 'port' in config\settings.ini." -f $cfg.port)
         return $false
     } catch { return $true }
 }
@@ -163,16 +218,24 @@ function Start-Server($cfg, [int]$level, [bool]$checkPort = $true, [string]$be =
         Log '[!] no GGUF on this key fits this host. Fix: put a smaller quant in models\ (6 GB VRAM / 16 GB RAM runs a 7-9B Q4 well).'
         return $null
     }
+    $script:ModelGB  = [math]::Round((Get-Item $main).Length / 1GB, 1)   # feeds the stall guard's grace window
+    $script:ModelFile = Split-Path -Leaf $main
     # API key comes from a file, never argv: argv is readable by any process on the host.
     $a = @('-m', $main, '--host', $cfg.host, '--port', $cfg.port, '-c', $cfg.ctx_size,
-           '-b', $cfg.batch, '--ubatch-size', $cfg.ubatch, '-a', $cfg.alias,
-           '--api-key-file', $KeyPath, '--log-file', $SrvLog)
+           '-b', $cfg.batch, '--ubatch-size', $cfg.ubatch,
+           '--api-key-file', $KeyPath, '--log-file', $SrvLog,
+           '--metrics')   # /metrics feeds the tok/s line in session.log; sampled on an existing watchdog tick
+    if ($cfg.alias) { $a += @('-a', $cfg.alias) }
     # level 1 drops KV-cache quantisation: q8_0 KV needs head_dim divisible by 32 and
     # kills the context on some architectures ("K cache type q8_0 ... does not divide n_embd_head_k").
     if ($level -lt 1 -and $cfg.kvct -and $cfg.kvct -ne 'f16') { $a += @('-ctk', $cfg.kvct, '-ctv', $cfg.kvct) }
     # ngl=auto => omit -ngl entirely and let llama.cpp's --fit choose the GPU/CPU split.
     if ($cfg.ngl -and $cfg.ngl -notmatch '^(?i:auto)$') { $a += @('-ngl', $cfg.ngl) }
     if ($cfg.flash_attn -ne 'off') { $a += @('--flash-attn', $cfg.flash_attn) }
+    # pin the GPU when the host has several (e.g. laptop iGPU + dGPU): llama picks Vulkan0
+    # otherwise, which on Optimus laptops is the slow Intel. Bad name = fast startup abort,
+    # visible in the run.bat window - that is the feedback, no extra validation needed here.
+    if ($cfg.device) { $a += @('--device', $cfg.device) }
     if ($cfg.webui -eq 'off')      { $a += '--no-webui' }
     if ($cfg.threads -ne '0')      { $a += @('-t', $cfg.threads) }
     # level 2 also drops speculative decoding (needs matching MTP/draft heads).
@@ -217,6 +280,20 @@ function Start-Tunnel($cfg) {
     $cf = Join-Path $Root 'bin\tools\cloudflared.exe'
     if (-not (Test-Path $cf)) { Log '[tun] bin\tools\cloudflared.exe missing - LAN only.'; return $null }
     Remove-Item $TunLog -Force -ErrorAction SilentlyContinue   # never report a dead URL as live
+    if ($cfg.tunnel_token) {
+        # Named tunnel (stable URL). The token travels via the ENVIRONMENT, never on a command
+        # line - same rule as --api-key-file. No usable tunnel_url => do not start (fail closed).
+        if ($cfg.tunnel_url -notmatch '(?i)^https://') {
+            Log '[tun] tunnel_token set but tunnel_url missing/not https - NOT starting (fail closed).'
+            return $null
+        }
+        $env:TUNNEL_TOKEN = $cfg.tunnel_token
+        $ta = Quote-Args @('tunnel','--no-autoupdate','--logfile',$TunLog,'--loglevel','info','run')
+        $p = Start-Process -FilePath $cf -WindowStyle Hidden -PassThru -ArgumentList $ta
+        $env:TUNNEL_TOKEN = $null
+        if ($p) { [IO.File]::WriteAllText($UrlPath, $cfg.tunnel_url); Log ('[tun] NAMED tunnel pid {0} - stable URL -> {1}' -f $p.Id, $cfg.tunnel_url) }
+        return $p
+    }
     $a = @('tunnel', '--no-autoupdate', '--url', "http://127.0.0.1:$($cfg.port)",
            '--logfile', $TunLog, '--loglevel', 'info')
     $p = Start-Process -FilePath $cf -ArgumentList (Quote-Args $a) -WindowStyle Hidden -PassThru
@@ -238,6 +315,14 @@ function Get-TunnelUrl([int]$timeoutSec = 60) {
     return $null
 }
 
+function Start-KeepAwake {
+    $ka = Join-Path $Root 'scripts\keepawake.ps1'
+    if (-not (Test-Path $ka)) { return $null }
+    $p = Start-Process powershell.exe -ArgumentList (Quote-Args @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ka)) -WindowStyle Hidden -PassThru
+    if ($p) { Log "[pwr] pid $($p.Id): blocks SYSTEM sleep only - display timers untouched, screen still blanks." }
+    return $p
+}
+
 function Test-Live($p) { $p -and (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) }
 
 function Test-Health($cfg) {
@@ -255,26 +340,44 @@ function Load-State {
     if (Test-Path $StatePath) { try { Get-Content $StatePath -Raw | ConvertFrom-Json } catch { $null } }
 }
 
+function Export-SessionPerf([switch]$Mid) {
+    # Harvest what exists: a SIGKILLed server flushes nothing, so this is the honest ceiling.
+    # Event counts come from the session file itself - zero new state to keep in sync.
+    $tag = $(if ($Mid) { '[harvest]' } else { '[end]' })
+    try {
+        $sl = @($(if (Test-Path $SessLog) { Get-Content $SessLog } else { @() }))
+        $up = -1
+        if ($sl.Count) { try { $up = ((Get-Date) - [datetime]::ParseExact($sl[0].Substring(0,19),'yyyy-MM-dd HH:mm:ss',$null)).TotalMinutes } catch { } }
+        Log ($tag + ' uptime {0} min | watchdog events: {1} | problem lines: {2}' -f `
+            $(if ($up -ge 0) { '{0:N0}' -f $up } else { '?' }), `
+            @($sl -match '\[wd\]').Count, @($sl -match '\[!\]').Count)
+        if (Test-Path $SrvLog) {
+            Log '--- llama.cpp timing tail (from server.log) ---'
+            Select-String -Path $SrvLog -Pattern 'model loaded|loading model|eval time|t/s|print_timing' |
+                Select-Object -Last 40 | ForEach-Object { Log ('    | ' + ($_.Line -replace '\x1b\[[0-9;]*m','')) }
+        }
+    } catch { }
+}
+
 function Stop-Everything {
+    Export-SessionPerf
     $st = Load-State
     if ($st) {
         foreach ($id in @($st.server, $st.tunnel, $st.keep)) {
             if ($id) { Get-Process -Id $id -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
         }
     }
-    # Ours only: processes whose image or command line points at this key.
-    foreach ($n in 'llama-server','cloudflared') {
-        Get-CimInstance Win32_Process -Filter "Name='$n.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($Root, 2) } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
+    # Ours only. Binaries via the shared sweep; powershell helpers additionally must have THIS
+    # key in their command line - another stick's or a dev clone's supervisor is never touched.
+    Stop-OurBinaries
+    $here = '*' + $Root + '*'
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like '*keepawake.ps1*' } |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like '*keepawake.ps1*' -and $_.CommandLine -like $here } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     # The watchdog loop itself is a plain powershell.exe off this key: without killing it,
     # "stop" closes the endpoint and 10 s later the loop resurrects server + tunnel.
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine -like $here -and
                        $_.CommandLine -like '*serve.ps1*' -and $_.CommandLine -like '* start*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Remove-Item $StatePath, $UrlPath -Force -ErrorAction SilentlyContinue
@@ -320,6 +423,14 @@ if ($prev -and $prev.server -and (Get-Process -Id $prev.server -ErrorAction Sile
     Stop-Everything
 }
 
+# Log cap: every watchdog tick appends forever and this file lives on the key.
+if ((Test-Path $SupLog) -and ((Get-Item $SupLog).Length -gt 50MB)) {
+    Get-Content $SupLog -Tail 2000 | Set-Content $SupLog
+    Log '[cfg] supervisor.log exceeded 50 MB - trimmed to its last 2000 lines.'
+}
+Remove-Item (Join-Path $LogDir '*.old') -Force -ErrorAction SilentlyContinue
+Remove-Item $SessLog -Force -ErrorAction SilentlyContinue   # one session per file: a new start overwrites
+
 $key  = Get-ApiKey
 Log "=== start  backend=$(Get-Backend $cfg.backend)  port=$($cfg.port)  tunnel=$($cfg.tunnel) ==="
 Log "[env] host=$env:COMPUTERNAME user=$env:USERNAME  (portable: nothing installed, no host-side state)"
@@ -346,25 +457,29 @@ if ($prof) {
 # size after a death is the signal that the binary never wrote anything (see the watchdog).
 $attemptLogLen = Get-LogLen
 $srv = Start-Server $cfg $level $true $becands[$beIdx]
-if (-not $srv) { Log '[!] cannot start - fix the above and re-run.'; if ($Visible) { pause }; exit 1 }
+if (-not $srv) { Log '[!] cannot start - fix the above and re-run.'; exit 1 }
+# --- session.log header: what this session was, for the review back home. Never keys/tokens. ---
+$ramGB = [math]::Round((Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize / 1MB, 1)
+Log ('[sys] host={0} user={1} RAM={2} GB' -f $env:COMPUTERNAME, $env:USERNAME, $ramGB)
+Log ('[cfg] session: backend={0} level={1} ngl={2} ctx={3} kvct={4} flash_attn={5} spec={6} port={7} tunnel={8}' -f `
+    $becands[$beIdx], $level, $cfg.ngl, $cfg.ctx_size, $cfg.kvct, $cfg.flash_attn, $cfg.spec_type, $cfg.port,
+    $(if ($cfg.tunnel_token) { 'named' } else { $cfg.tunnel }))
+Log ('[cfg] model: {0} ({1} GB)' -f $script:ModelFile, $script:ModelGB)
+$loadT0 = Get-Date
 
 $tun = $null; $keep = $null
-if ($cfg.tunnel -ne 'off') {
+# Only the literal 'on' may ever enable the tunnel: a blank or corrupt value stays OFF
+# (fail closed - a damaged settings.ini must never expose the port).
+if ($cfg.tunnel -eq 'on') {
     $tun = Start-Tunnel $cfg
     if ($tun) {
-        $url = Get-TunnelUrl 60
+        $url = if ($cfg.tunnel_token) { if (Test-Path $UrlPath) { ([IO.File]::ReadAllText($UrlPath)).Trim() } } else { Get-TunnelUrl 60 }
         if ($url) { Log "[tun] PUBLIC  ->  $url"; Log "[tun] clients must send:  Authorization: Bearer $key" }
         else      { Log '[tun] no URL yet (offline / API blocked) - retrying in background; LAN endpoint stays up.' }
     }
 }
 
-if ($cfg.keepawake -ne 'off') {
-    $ka = Join-Path $Root 'scripts\keepawake.ps1'
-    if (Test-Path $ka) {
-        $keep = Start-Process powershell.exe -ArgumentList (Quote-Args @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ka)) -WindowStyle Hidden -PassThru
-        Log "[pwr] pid $($keep.Id): blocks SYSTEM sleep only - display timers untouched, screen still blanks."
-    }
-}
+if ($cfg.keepawake -eq 'on') { $keep = Start-KeepAwake }
 
 Save-State $srv $tun $keep $cfg
 '  local    http://localhost:{0}/v1/chat/completions' -f $cfg.port
@@ -377,11 +492,16 @@ $everHealthy = $false      # escalation is driven by "never served a request", n
 $fastFails = 0
 $stallTicks = 0
 $lastLogLen = -1
+$mtPrev = $null; $msPrev = 0.0; $mxFails = 0   # /metrics tok/s sampling state
 while ($true) {
     Start-Sleep -Seconds 10
 
     if (Test-Health $cfg) { $fastFails = 0
-        if (-not $everHealthy) { $everHealthy = $true; Set-Content -Path $ProfPath -Value ($env:COMPUTERNAME + '|' + $becands[$beIdx] + '|' + $level + '|' + $cfg.ngl) -Encoding ASCII }  # remember what worked
+        if (-not $everHealthy) {
+            $everHealthy = $true
+            Set-Content -Path $ProfPath -Value ($env:COMPUTERNAME + '|' + $becands[$beIdx] + '|' + $level + '|' + $cfg.ngl) -Encoding ASCII   # remember what worked
+            Log ('[perf] serving after {0:N0} s' -f ((Get-Date) - $loadT0).TotalSeconds)
+        }
     }
 
     # Alive but never healthy and server.log has not grown for ~6 min => wedged (a hung load, a
@@ -390,9 +510,13 @@ while ($true) {
     $logLen = Get-LogLen
     if ((Test-Live $srv) -and -not $everHealthy) {
         if ($logLen -eq $lastLogLen) { $stallTicks++ } else { $stallTicks = 0; $lastLogLen = $logLen }
-        if ($stallTicks -ge 36) {
-            Log '[wd] alive but no log progress for ~6 min before ever serving - killing it and treating it as a failed load.'
+        # Grace scales with the weights: a 16 GB read over USB 2 can go quiet ~10 min mid-load,
+        # and killing a healthy load burns one of the three retries. ~40 s extra per GB.
+        $stallLimit = 36 + [int][math]::Ceiling($(if ($script:ModelGB) { $script:ModelGB } else { 0 }) * 4)
+        if ($stallTicks -ge $stallLimit) {
+            Log ('[wd] alive but no log progress for ~{0} min before ever serving - killing it and treating it as a failed load.' -f [math]::Round($stallLimit * 10 / 60))
             $stallTicks = 0
+            Export-SessionPerf -Mid   # harvest timings now: the next server boot rewrites server.log
             Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
         }
     }
@@ -437,19 +561,56 @@ while ($true) {
         $attemptLogLen = Get-LogLen
         $srv = Start-Server $cfg $level $false $becands[$beIdx]
         $liveSince = Get-Date
+        $loadT0 = Get-Date
         $everHealthy = $false
         $stallTicks = 0; $lastLogLen = -1
         if (-not $srv) { Log '[wd] restart failed - retry in 30s'; Start-Sleep -Seconds 30; continue }
         Save-State $srv $tun $keep $cfg
     }
 
-    if ($cfg.tunnel -ne 'off' -and -not (Test-Live $tun)) {
+    if ($cfg.tunnel -eq 'on' -and -not (Test-Live $tun)) {
         $tun = Start-Tunnel $cfg
         if ($tun) {
-            $url = Get-TunnelUrl 60
+            $url = if ($cfg.tunnel_token) { if (Test-Path $UrlPath) { ([IO.File]::ReadAllText($UrlPath)).Trim() } } else { Get-TunnelUrl 60 }
             # quick tunnels mint a NEW hostname per restart; status.bat always shows the live one
             if ($url) { Log "[tun] PUBLIC (renewed)  ->  $url" }
             Save-State $srv $tun $keep $cfg
         } else { Start-Sleep -Seconds 30 }
+    }
+
+    # keepawake is as replaceable as the tunnel: if it died, the sleep veto died with it and a
+    # sleeping laptop at 3 am serves nobody. ($keep null = script was missing from the start.)
+    if ($cfg.keepawake -eq 'on' -and $keep -and -not (Test-Live $keep)) {
+        Log '[wd] keepawake died - re-arming sleep veto.'
+        $keep = Start-KeepAwake
+        Save-State $srv $tun $keep $cfg
+    }
+
+    # cloudflared alive but no URL yet (DNS blip at boot): the start message promised a background
+    # retry - do it. Named tunnels write their URL at start, so this stays a no-op for them.
+    if ($cfg.tunnel -eq 'on' -and (Test-Live $tun) -and -not (Test-Path $UrlPath)) {
+        $u2 = Get-TunnelUrl 15
+        if ($u2) { Log "[tun] PUBLIC (late)  ->  $u2"; Save-State $srv $tun $keep $cfg }
+    }
+
+    # tok/s, measured server-side, sampled on a tick that already runs (loopback GET, sub-ms).
+    # Logs only when tokens actually moved; stops honestly after three failures.
+    if ($mxFails -lt 3) {
+        try {
+            $mx = (Invoke-WebRequest "http://127.0.0.1:$($cfg.port)/metrics" -UseBasicParsing -TimeoutSec 2 `
+                    -Headers @{ Authorization = "Bearer $key" }).Content
+            $gt = 0.0; $gs = 0.0
+            foreach ($l in ($mx -split "`n")) {
+                if     ($l -like 'llamacpp:tokens_predicted_total *')         { $gt = [double]($l -split ' ')[1] }
+                elseif ($l -like 'llamacpp:tokens_predicted_seconds_total *') { $gs = [double]($l -split ' ')[1] }
+            }
+            if ($null -ne $mtPrev -and $gt -gt $mtPrev -and ($gs - $msPrev) -gt 0.01) {
+                Log ('[perf] ~{0:N1} tok/s server-side ({1:N0} tok this tick)' -f (($gt - $mtPrev) / ($gs - $msPrev)), ($gt - $mtPrev))
+            }
+            $mtPrev = $gt; $msPrev = $gs
+        } catch {
+            $mxFails++
+            if ($mxFails -eq 3) { Log '[perf] /metrics unavailable - tok/s sampling off for this session.' }
+        }
     }
 }

@@ -18,6 +18,7 @@ of this section - no markdown, readable on any machine, safe to hand to someone 
 | `run.bat` | Same, but in a visible window (shows the URL, and any error, before you walk away). |
 | `status.bat` | Is it up? Local URL, **public URL**, API key, live `/v1/models` probe through the tunnel. |
 | `stop.bat` | Kills what it started, closes the public URL, releases the sleep veto. |
+| `chat.html` | Zero-install test chat UI — double-click, pick local or public URL, paste the key, stream. Shows TTFT and ≈tok/s per answer. |
 
 Endpoint + key (also printed by `status.bat`, stable while running):
 
@@ -66,6 +67,9 @@ model this laptop can actually hold** and says so in `logs\supervisor.log`:
 ## When things go wrong
 
 All logs stay on the key (`logs\supervisor.log`, `server.log`, `tunnel.log`, `power.log`).
+`logs\session.log` is the review file for the current session - header of what was chosen
+(backend/model/ngl/...), load time, server-measured tok/s, problems, timing tail. It is
+overwritten at every start, so bring the key home and read it before starting again.
 Nothing is written to the host's temp, registry, or startup; `TEMP`/`TMP` are redirected to `tmp\`.
 
 - **Watchdog (10 s):** restarts `llama-server` and the tunnel if either dies. A new
@@ -77,7 +81,9 @@ Nothing is written to the host's temp, registry, or startup; `TEMP`/`TMP` are re
   writing anything (missing `cudart64_12` / `cublas64_12`, no kernels for the GPU) or the log shows
   a backend/driver error - the key moves to the next backend (`cuda` -> `vulkan` -> `cpu`) instead
   of retrying the same dead binary. A config argument the model rejects is *not* a backend problem,
-  so that path escalates optimisation instead of hopping.
+  so that path escalates optimisation instead of hopping. A CUDA build that sees **zero** devices
+  (wrong SASS arch) does not die - it "succeeds" on the CPU at a fifth of the speed - so serve.ps1
+  probes `--list-devices` before ever selecting cuda and skips it when it reports `(none)`.
 - **Degrade ladder:** if the server dies *before ever serving a request*, it retries with less
   optimisation — level 1 drops KV-cache quantisation (`q8_0` KV is invalid for some head
   widths), level 2 also drops speculative decoding. **3 further failures → it gives up and
@@ -87,7 +93,9 @@ Nothing is written to the host's temp, registry, or startup; `TEMP`/`TMP` are re
   Delete that file after changing models or settings to try full optimisation again.
 - **Tunnel**: Cloudflare quick tunnel (`bin\tools\cloudflared.exe`, no account, works behind
   NAT/CGNAT). The hostname is random and **changes whenever cloudflared restarts** — check
-  `status.bat` after a restart, or set up a named tunnel + your own domain for a stable address.
+  `status.bat` after a restart, or set up a named tunnel + your own domain for a stable address:
+  put the token and your `https` hostname in `tunnel_token` / `tunnel_url` in
+  `config\settings.ini` — the token travels via the environment, never on a command line.
 - **Keep-awake:** blocks **system sleep only** (`ES_CONTINUOUS | ES_SYSTEM_REQUIRED`).
   `ES_DISPLAY_REQUIRED` is never set, so **the screen still turns off** on your normal
   power-plan timer (this laptop: 10 min AC / 4 min DC) and wakes back on mouse/keyboard.
@@ -96,6 +104,8 @@ Nothing is written to the host's temp, registry, or startup; `TEMP`/`TMP` are re
   PC unless Power Options → lid close = *Do nothing*. Keep it plugged in.
 - **Second start** while already running just reports the existing pid (no port fight).
 - **Port already taken** by another program → refuses and says so, instead of serving nothing.
+  A `llama-server`/`cloudflared` left behind by **this same key** (e.g. a crash that lost
+  `state.json`) is swept first, so REFUSE now always means a foreign process holds the port.
 
 ## Agentic coding (pi-agent / Aider / Cline / Continue)
 
@@ -148,7 +158,7 @@ models\*.gguf                your models
 scripts\serve.ps1            supervisor: start | stop | status
 scripts\keepawake.ps1        sleep veto, screen-off preserved
 logs\  tmp\                  temporary stuff stays on the key
-legacy\                      superseded scripts, kept for reference
+legacy\                      superseded scripts (exist on the stick only - gitignored)
 ```
 
 ## Notes
@@ -161,9 +171,12 @@ legacy\                      superseded scripts, kept for reference
   so a damaged config can never expose the port by accident.
 - **Which GPU path you get**: `bin\cuda` imports `cudart64_12.dll` + `cublas64_12.dll` (so the host
   needs a CUDA 12 runtime installed) and carries SASS **only for sm_50/61/70/75/80/90, no PTX**.
-  That means Ampere/Ada/Hopper go CUDA; **RTX 50-series (sm_120) cannot use this CUDA build** and is
-  served by `bin\vulkan` automatically — fine, Vulkan is close behind CUDA and needs no CUDA install,
-  just a current GPU driver. Pin `backend=vulkan` to skip the first probing attempt.
+  That means desktop Ampere/Ada/Hopper go CUDA; **RTX 50-series (sm_120) and 30-series *laptop* cards
+  (sm_86) cannot use this CUDA build** - its device probe returns `(none)` on those, and the key then
+  serves them from `bin\vulkan` automatically (Vulkan is close behind CUDA, needs no CUDA install,
+  just a current GPU driver; `session.log` will show the honest tok/s either way).
+  On laptops with both an iGPU and a dGPU the vulkan build prefers the discrete card; if it ever
+  picks wrong, `device=Vulkan1` (exact id from `--list-devices`) pins it.
 - **Expected performance**, honest version: a 27 B Q4 model wants ~17 GB for weights plus KV cache,
   so it needs 32 GB system RAM, and it only *runs fast* when most layers fit in VRAM (16 GB+ card,
   or 8 GB + aggressive CPU offload). Big-GPU laptop: thousands of tok/s prefill, tens of tok/s

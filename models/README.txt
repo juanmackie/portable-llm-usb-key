@@ -23,7 +23,7 @@ Check a download BEFORE you rely on it (needs Python, optional):
 
     python ..\scripts\gguf-check.py mymodel.gguf
 
-It prints the architecture, whether llama.cpp can be expected to know it, whether a chat template
+It prints the architecture (with layer count and trained context length), whether a chat template
 is present, and whether the file is long enough to hold every tensor - which is how you catch a
 "16 GB" file that stopped at 1.4 GB.
 

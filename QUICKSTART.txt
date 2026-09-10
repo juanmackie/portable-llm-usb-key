@@ -28,6 +28,9 @@ USE IT  (once status.bat shows a public URL)
     API key  = the "api key" line from status.bat
     model    = local
 
+  Quickest test: double-click chat.html on this key - a self-contained
+  chat page. Pick Local or Public, paste the URL + key, hit Connect.
+
   curl (cmd):
     curl -X POST "https://XXXX.trycloudflare.com/v1/chat/completions" ^
          -H "Authorization: Bearer PASTE_KEY_FROM_status.bat" ^
@@ -44,7 +47,9 @@ USE IT  (once status.bat shows a public URL)
 
   The public address CHANGES every time the tunnel restarts. Run
   status.bat after each start to get the current one. Without the key,
-  the public URL answers 401 - that is the point.
+  the public URL answers 401 - that is the point. If settings.ini has a
+  named tunnel configured (tunnel_token + tunnel_url), the address is
+  fixed and never changes.
 
 WHICH MODEL, WHICH GPU
   The stick uses the biggest model in models\ that this laptop can hold.
@@ -57,6 +62,8 @@ IF IT DOES NOT DO WHAT YOU WANT
   1. run.bat              the window says what it refused, and why
   2. status.bat           what is up, what is not
   3. logs\supervisor.log  the whole story, newest at the bottom
+  4. logs\session.log     just this session: choices, load time, tok/s,
+                          problems - overwritten at the next start
   Nothing is broken permanently - fix the cause, double-click launch.vbs.
 
 BEFORE YOU PULL THE STICK OUT

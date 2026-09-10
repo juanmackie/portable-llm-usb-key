@@ -22,13 +22,23 @@ param(
     [switch]$Cuda,
     [switch]$Cudart,
     [switch]$All,
-    [string]$Build = 'b10797',
+    [string]$Build = '',
     [string]$Root  = (Split-Path -Parent $PSCommandPath)
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'   # Invoke-WebRequest's progress bar slows big downloads ~10x
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if ($All) { $Cuda = $true; $Cudart = $true }
+
+# Default to the newest llama.cpp release; the pinned build is only the offline fallback.
+if (-not $Build) {
+    try {
+        $rel = Invoke-RestMethod 'https://api.github.com/repos/ggml-org/llama.cpp/releases/latest' -Headers @{ 'User-Agent' = 'usb-inference-key' } -UseBasicParsing
+        if ($rel.tag_name -match '^b\d+$') { $Build = $rel.tag_name }
+    } catch { Write-Host ('  latest-release query failed: ' + $_.Exception.Message) }
+    if (-not $Build) { $Build = 'b10797'; Write-Host ('  falling back to pinned build ' + $Build) }
+}
 
 $tmp = Join-Path $Root 'tmp'
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
@@ -37,8 +47,15 @@ $base = "https://github.com/ggml-org/llama.cpp/releases/download/$Build"
 function Get-Asset([string]$url) {
     $z = Join-Path $tmp ([IO.Path]::GetFileName($url))
     Write-Host ('  downloading {0}' -f (Split-Path -Leaf $z))
-    Invoke-WebRequest -Uri $url -OutFile $z -UseBasicParsing
-    return $z
+    # Hotel Wi-Fi dies mid-download: three tries, partial file never lingers.
+    for ($try = 1; $try -le 3; $try++) {
+        try { Invoke-WebRequest -Uri $url -OutFile $z -UseBasicParsing; return $z }
+        catch {
+            Remove-Item $z -Force -ErrorAction SilentlyContinue
+            if ($try -eq 3) { throw }
+            Write-Host ('     failed, retry {0}/2 in 5 s' -f $try); Start-Sleep -Seconds 5
+        }
+    }
 }
 
 function Install-Asset([string]$zip, [string]$into, [string]$marker) {
@@ -69,8 +86,7 @@ foreach ($p in $picks) {
 
 $cf = Join-Path $Root 'bin\tools\cloudflared.exe'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $cf) | Out-Null
-Write-Host '  downloading cloudflared-windows-amd64.exe'
-Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf -UseBasicParsing
+Move-Item -Force (Get-Asset 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe') $cf
 
 Remove-Item (Join-Path $tmp '*.zip') -Force -ErrorAction SilentlyContinue
 Write-Host ''
