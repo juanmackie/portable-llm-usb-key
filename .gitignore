@@ -25,3 +25,7 @@
 /ntldr
 /desktop.ini
 Thumbs.db
+
+# Python bytecode from the helper scripts.
+__pycache__/
+*.pyc
