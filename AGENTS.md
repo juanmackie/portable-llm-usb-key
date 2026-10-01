@@ -1,8 +1,8 @@
 # portable-llm-usb-key agent contract
 
 ## Operating Standard
-- Apply `C:\Users\juanm\Documents\GitHub\Vibe Coding Rules 10.md` (V10) as the repository operating standard; read it in full before substantive work.
-- This file is the nearest-owning contract. It refines the parent policy with repository-specific facts and cannot weaken a mandatory parent rule; conflicts resolve to the parent.
+- Apply the global AGENTS.md (`~/.pi/agent/AGENTS.md`, loaded automatically) as the operating standard.
+- This file holds repository-specific facts. They override global defaults (commands, runners, paths, constraints) but cannot weaken a global approval, security, or secrets rule.
 
 ## Scope and Ownership
 This repo is a USB inference key: scripts and docs only that run llama.cpp and a Cloudflare quick tunnel off a Windows 10/11 laptop with no install, no admin, no account, nothing left on the host. `bin\` and `models\` are gitignored binaries/weights, fetched or copied in per stick.
